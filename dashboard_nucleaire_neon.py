@@ -434,24 +434,25 @@ def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
     all_data: dict[date, pd.DataFrame] = {}
     echecs:   list[tuple[str, str]]   = []
     barre   = st.progress(0.0, text=f"⚡ {len(a_fetcher)} jour(s) à télécharger…")
-    done    = 0
 
-    # Les threads exécutent UNIQUEMENT api_telecharger_jour (fonction pure, aucun st.*).
-    # La barre de progression est mise à jour ICI, dans le thread principal,
-    # au fur et à mesure que les résultats arrivent → pas de NoSessionContext.
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_API) as ex:
-        futures = {ex.submit(api_telecharger_jour, j): j for j in a_fetcher}
-        for fut in as_completed(futures):
-            try:
-                jour, df, err = fut.result()
-                if not df.empty:
-                    all_data[jour] = df
-                else:
-                    echecs.append((str(futures[fut]), err or "Aucune donnée"))
-            except Exception as exc:
-                echecs.append((str(futures[fut]), f"{type(exc).__name__}: {exc}"))
-            done += 1
-            barre.progress(done / len(a_fetcher), text=f"⚡ {done}/{len(a_fetcher)} jour(s)…")
+    # Téléchargement SÉQUENTIEL dans le thread principal.
+    # Pas de ThreadPoolExecutor → pas de NoSessionContext possible.
+    # Un seul client ENTSO-E réutilisé pour tous les jours.
+    client = EntsoePandasClient(api_key=API_KEY)
+    for i, j in enumerate(a_fetcher):
+        try:
+            start_ts = pd.Timestamp(str(j) + " 00:00", tz=TZ)
+            end_ts   = pd.Timestamp(str(j) + " 23:59", tz=TZ)
+            df_raw   = client.query_generation_per_plant(
+                country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
+            )
+            if df_raw is None or df_raw.empty:
+                echecs.append((str(j), "Aucune donnée publiée par ENTSO-E"))
+            else:
+                all_data[j] = extraire_actual_aggregated(df_raw)
+        except Exception as exc:
+            echecs.append((str(j), f"{type(exc).__name__}: {exc}"[:200]))
+        barre.progress((i + 1) / len(a_fetcher), text=f"⚡ {i+1}/{len(a_fetcher)} jour(s)…")
 
     barre.empty()
 
