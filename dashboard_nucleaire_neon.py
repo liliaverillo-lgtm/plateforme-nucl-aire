@@ -3,24 +3,33 @@
 Dashboard — Modulation nucléaire par réacteur (France)
 Normalisation par la puissance nominale IAEA PRIS
 
-SECRET STREAMLIT :
-  DATABASE_URL = "postgresql://..."
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ MISE EN PLACE NEON (une seule fois, 2 minutes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1) Créer un compte gratuit sur https://neon.tech
+ 2) "Create project" → nommer "nucleaire-cache"
+ 3) Dashboard → "Connection Details" → copier la chaîne
+    qui commence par : postgresql://...
+ 4) Dans Streamlit Cloud → Settings → Secrets, coller :
+      DATABASE_URL = "postgresql://user:pass@xxx.neon.tech/neondb?sslmode=require"
 
-REQUIREMENTS :
-  entsoe-py / pandas / plotly / streamlit / psycopg2-binary
+ En local : créer .streamlit/secrets.toml avec la même clé.
 
-NOTE : query_generation_per_plant (ENTSO-E) est limitée à 1 jour par requête.
-Les jours manquants sont donc téléchargés 1 par 1, mais EN PARALLÈLE (4 threads).
-Toutes les autres optimisations (SQLite local, bulk DB, cache RAM) restent actives.
+ REQUIREMENTS
+━━━━━━━━━━━━━
+ entsoe-py
+ pandas
+ plotly
+ streamlit
+ psycopg2-binary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
 import math
-import sqlite3
 import threading
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
 
@@ -28,7 +37,6 @@ import streamlit as st
 import pandas as pd
 import psycopg2
 import psycopg2.extras
-import psycopg2.pool
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from entsoe import EntsoePandasClient
@@ -43,9 +51,8 @@ COUNTRY               = "FR"
 TZ                    = "Europe/Paris"
 SEUIL_ON_PCT          = 5
 N_COLS_SPARKLINES     = 4
-MAX_WORKERS_API       = 4    # jours en parallèle
+MAX_WORKERS_API       = 4
 REFRESH_TODAY_MINUTES = 30
-LOCAL_DB_PATH         = "/tmp/nucleaire_local.db"
 
 PUISSANCE_NOMINALE_MW = {
     "BUGEY 2": 910,  "BUGEY 3": 910,  "BUGEY 4": 880,  "BUGEY 5": 880,
@@ -70,9 +77,9 @@ PUISSANCE_NOMINALE_MW = {
     "FLAMANVILLE 3": 1630,
 }
 
-AUJOURDHUI  = datetime.now().date()
-HIER        = AUJOURDHUI - timedelta(days=1)
-_local_lock = threading.Lock()
+AUJOURDHUI = datetime.now().date()
+HIER       = AUJOURDHUI - timedelta(days=1)
+_db_lock   = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -80,6 +87,7 @@ _local_lock = threading.Lock()
 # ══════════════════════════════════════════════════════════════════
 
 def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
+    """MultiIndex ENTSO-E → DataFrame wide (réacteur → MW)."""
     if isinstance(df.columns, pd.MultiIndex):
         niv0 = df.columns.get_level_values(0).astype(str)
         niv1 = df.columns.get_level_values(1).astype(str)
@@ -98,214 +106,147 @@ def extraire_actual_aggregated(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. NEON — PERSISTANCE CLOUD (écritures + sync initiale)
+# 2. BASE DE DONNÉES NEON (PostgreSQL)
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner=False)
-def _get_neon_pool() -> psycopg2.pool.ThreadedConnectionPool:
+def _conn() -> psycopg2.extensions.connection:
+    """Nouvelle connexion PostgreSQL (légère, fermée après usage)."""
     try:
-        dsn = st.secrets["DATABASE_URL"]
+        return psycopg2.connect(st.secrets["DATABASE_URL"], connect_timeout=10)
     except KeyError:
-        st.error("🔑 Secret `DATABASE_URL` manquant.")
+        st.error(
+            "🔑 **Secret manquant.** "
+            "Ajoutez `DATABASE_URL` dans les secrets Streamlit.\n\n"
+            "Voir les instructions en haut du fichier source."
+        )
         st.stop()
-    return psycopg2.pool.ThreadedConnectionPool(
-        minconn=1, maxconn=5, dsn=dsn, connect_timeout=15
-    )
 
-def _neon_get():
-    try:
-        return _get_neon_pool().getconn()
-    except psycopg2.pool.PoolError:
-        _get_neon_pool.clear()
-        return _get_neon_pool().getconn()
 
-def _neon_put(conn) -> None:
-    try:
-        _get_neon_pool().putconn(conn)
-    except Exception:
-        pass
-
-def _neon_init_schema() -> None:
-    conn = _neon_get()
+def init_db() -> None:
+    """Crée les tables si elles n'existent pas (idempotent)."""
+    conn = _conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS production (
-                        ts TEXT NOT NULL, reacteur TEXT NOT NULL, mw REAL,
-                        PRIMARY KEY (ts, reacteur))""")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_prod_ts ON production(ts)")
+                        ts       TEXT NOT NULL,
+                        reacteur TEXT NOT NULL,
+                        mw       REAL,
+                        PRIMARY KEY (ts, reacteur)
+                    )
+                """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_prod_ts ON production(ts)"
+                )
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS jours_charges (
-                        jour TEXT PRIMARY KEY, charge_ts TEXT NOT NULL,
-                        est_complet INTEGER NOT NULL DEFAULT 1)""")
+                        jour        TEXT    PRIMARY KEY,
+                        charge_ts   TEXT    NOT NULL,
+                        est_complet INTEGER NOT NULL DEFAULT 1
+                    )
+                """)
     finally:
-        _neon_put(conn)
+        conn.close()
 
 
-# ══════════════════════════════════════════════════════════════════
-# 3. SQLITE LOCAL — TOUTES LES LECTURES (< 5 ms, zéro réseau)
-# ══════════════════════════════════════════════════════════════════
-
-@st.cache_resource(show_spinner="⏳ Chargement initial depuis Neon…")
-def _init_local_db() -> sqlite3.Connection:
-    """
-    Télécharge Neon → SQLite local au démarrage (une seule fois).
-    Après ça, toutes les lectures sont locales (< 5 ms).
-    """
-    _neon_init_schema()
-
-    conn = sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=20000")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS production (
-            ts TEXT NOT NULL, reacteur TEXT NOT NULL, mw REAL,
-            PRIMARY KEY (ts, reacteur)
-        );
-        CREATE INDEX IF NOT EXISTS idx_prod_ts ON production(ts);
-        CREATE TABLE IF NOT EXISTS jours_charges (
-            jour TEXT PRIMARY KEY, charge_ts TEXT NOT NULL,
-            est_complet INTEGER NOT NULL DEFAULT 1
-        );
-    """)
-
+def jour_est_cache(jour: date) -> bool:
+    """True si le jour est en DB et frais."""
+    conn = _conn()
     try:
-        neon = _neon_get()
-        try:
-            df_j = pd.read_sql("SELECT * FROM jours_charges ORDER BY jour", neon)
-            df_p = pd.read_sql("SELECT * FROM production ORDER BY ts", neon)
-        finally:
-            _neon_put(neon)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT charge_ts, est_complet FROM jours_charges WHERE jour = %s",
+                (str(jour),)
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
 
-        conn.execute("DELETE FROM jours_charges")
-        conn.execute("DELETE FROM production")
-        if not df_j.empty:
-            df_j.to_sql("jours_charges", conn, if_exists="append", index=False)
-        if not df_p.empty:
-            for i in range(0, len(df_p), 50_000):
-                df_p.iloc[i:i+50_000].to_sql("production", conn, if_exists="append", index=False)
-        conn.commit()
-    except Exception as e:
-        st.warning(f"⚠️ Sync Neon → local impossible : {e}")
-
-    return conn
-
-def _ldb() -> sqlite3.Connection:
-    return _init_local_db()
+    if row is None:
+        return False
+    charge_ts_str, est_complet = row
+    if not est_complet:
+        age_min = (datetime.now() - datetime.fromisoformat(charge_ts_str)).total_seconds() / 60
+        return age_min < REFRESH_TODAY_MINUTES
+    return True
 
 
-# ══════════════════════════════════════════════════════════════════
-# 4. OPÉRATIONS BASE DE DONNÉES
-# ══════════════════════════════════════════════════════════════════
-
-def jours_a_fetcher_depuis_db(jours: list[date]) -> list[date]:
-    """1 seule requête SQLite locale."""
-    if not jours:
-        return []
-    placeholders = ",".join("?" * len(jours))
-    rows = _ldb().execute(
-        f"SELECT jour, charge_ts, est_complet FROM jours_charges WHERE jour IN ({placeholders})",
-        [str(j) for j in jours]
-    ).fetchall()
-    en_cache: set[date] = set()
-    for jour_str, charge_ts_str, est_complet in rows:
-        j = date.fromisoformat(jour_str)
-        if est_complet:
-            en_cache.add(j)
-        else:
-            age_min = (datetime.now() - datetime.fromisoformat(charge_ts_str)).total_seconds() / 60
-            if age_min < REFRESH_TODAY_MINUTES:
-                en_cache.add(j)
-    return [j for j in jours if j not in en_cache]
-
-
-def sauvegarder_plage_en_db(data: dict[date, pd.DataFrame]) -> None:
-    """Sauvegarde tous les jours en 1 seule transaction (local + Neon)."""
-    all_rows:   list[tuple] = []
-    jours_meta: list[tuple] = []
-
-    for jour, df_wide in data.items():
-        if df_wide.empty:
-            continue
-        idx = df_wide.index
-        if idx.tz is None:
-            idx = idx.tz_localize("UTC")
-        ts_utc = idx.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S")
-        df_tmp            = df_wide.copy()
-        df_tmp.index      = ts_utc
-        df_tmp.index.name = "ts"
-        df_long = (
-            df_tmp.reset_index()
-                  .melt(id_vars="ts", var_name="reacteur", value_name="mw")
-                  .dropna(subset=["mw"])
-        )
-        all_rows.extend(tuple(r) for r in df_long[["ts", "reacteur", "mw"]].values.tolist())
-        est_complet = 1 if jour < datetime.now().date() else 0
-        jours_meta.append((str(jour), datetime.now().isoformat(), est_complet))
-
-    if not all_rows:
+def sauvegarder_en_db(jour: date, df_wide: pd.DataFrame) -> None:
+    """Persiste df_wide dans Neon (PostgreSQL)."""
+    if df_wide.empty:
         return
 
-    # 1. SQLite local (rapide)
-    with _local_lock:
-        conn = _ldb()
-        conn.executemany(
-            "INSERT OR REPLACE INTO production (ts, reacteur, mw) VALUES (?, ?, ?)", all_rows
-        )
-        conn.executemany(
-            "INSERT OR REPLACE INTO jours_charges (jour, charge_ts, est_complet) VALUES (?, ?, ?)",
-            jours_meta
-        )
-        conn.commit()
+    idx = df_wide.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    ts_utc = idx.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 2. Neon (persistance cloud)
-    try:
-        neon = _neon_get()
+    df_tmp = df_wide.copy()
+    df_tmp.index      = ts_utc
+    df_tmp.index.name = "ts"
+    df_long = (
+        df_tmp.reset_index()
+              .melt(id_vars="ts", var_name="reacteur", value_name="mw")
+              .dropna(subset=["mw"])
+    )
+    rows = [tuple(r) for r in df_long[["ts", "reacteur", "mw"]].values.tolist()]
+    if not rows:
+        return
+
+    est_complet = 1 if jour < datetime.now().date() else 0
+
+    with _db_lock:
+        conn = _conn()
         try:
-            with neon:
-                with neon.cursor() as cur:
+            with conn:
+                with conn.cursor() as cur:
+                    # Upsert PostgreSQL (équivalent de INSERT OR REPLACE)
                     psycopg2.extras.execute_values(
                         cur,
                         """INSERT INTO production (ts, reacteur, mw) VALUES %s
                            ON CONFLICT (ts, reacteur) DO UPDATE SET mw = EXCLUDED.mw""",
-                        all_rows, page_size=1000
+                        rows
                     )
-                    psycopg2.extras.execute_values(
-                        cur,
-                        """INSERT INTO jours_charges (jour, charge_ts, est_complet) VALUES %s
+                    cur.execute(
+                        """INSERT INTO jours_charges (jour, charge_ts, est_complet)
+                           VALUES (%s, %s, %s)
                            ON CONFLICT (jour) DO UPDATE
                            SET charge_ts = EXCLUDED.charge_ts,
                                est_complet = EXCLUDED.est_complet""",
-                        jours_meta
+                        (str(jour), datetime.now().isoformat(), est_complet)
                     )
         finally:
-            _neon_put(neon)
-    except Exception as e:
-        print(f"[NEON SAVE ERREUR] {type(e).__name__}: {e}", flush=True)
+            conn.close()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def charger_depuis_db(start: date, end: date) -> pd.DataFrame:
-    """Lecture SQLite locale uniquement (< 5 ms). Cache RAM 5 min."""
+    """Charge [start, end] depuis Neon."""
     start_sql = (datetime.combine(start, datetime.min.time()) - timedelta(hours=3)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-    end_sql   = (datetime.combine(end,   datetime.min.time()) + timedelta(hours=27)) \
+    end_sql   = (datetime.combine(end, datetime.min.time()) + timedelta(hours=27)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-    rows = _ldb().execute(
-        "SELECT ts, reacteur, mw FROM production WHERE ts >= ? AND ts <= ? ORDER BY ts",
-        (start_sql, end_sql)
-    ).fetchall()
-    if not rows:
+
+    conn = _conn()
+    try:
+        df_long = pd.read_sql_query(
+            "SELECT ts, reacteur, mw FROM production WHERE ts >= %s AND ts <= %s ORDER BY ts",
+            conn, params=(start_sql, end_sql)
+        )
+    finally:
+        conn.close()
+
+    if df_long.empty:
         return pd.DataFrame()
-    df_long = pd.DataFrame(rows, columns=["ts", "reacteur", "mw"])
+
     df_long["ts"] = pd.to_datetime(df_long["ts"], utc=True).dt.tz_convert(TZ)
     borne_start   = pd.Timestamp(str(start),             tz=TZ)
     borne_end     = pd.Timestamp(str(end) + " 23:59:59", tz=TZ)
     df_long = df_long[(df_long["ts"] >= borne_start) & (df_long["ts"] <= borne_end)]
+
     if df_long.empty:
         return pd.DataFrame()
+
     df_wide = df_long.pivot_table(index="ts", columns="reacteur", values="mw", aggfunc="mean")
     df_wide.columns.name = None
     df_wide.index.name   = None
@@ -314,75 +255,73 @@ def charger_depuis_db(start: date, end: date) -> pd.DataFrame:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def stats_cache() -> dict:
+    """Statistiques rapides sur le cache (sidebar)."""
     try:
-        rows  = _ldb().execute("SELECT jour FROM jours_charges ORDER BY jour").fetchall()
-        jours = [r[0] for r in rows]
+        conn = _conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT jour FROM jours_charges ORDER BY jour")
+                jours = [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
         return {"n": len(jours), "min": jours[0] if jours else None, "max": jours[-1] if jours else None}
     except Exception:
         return {"n": 0, "min": None, "max": None}
 
 
 def purger_periode_db(start: date, end: date) -> int:
+    """Supprime une période du cache Neon."""
     jours     = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     start_sql = (datetime.combine(start, datetime.min.time()) - timedelta(hours=3)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-    end_sql   = (datetime.combine(end,   datetime.min.time()) + timedelta(hours=27)) \
+    end_sql   = (datetime.combine(end, datetime.min.time()) + timedelta(hours=27)) \
                 .strftime("%Y-%m-%dT%H:%M:%S")
-    with _local_lock:
-        conn = _ldb()
-        conn.execute("DELETE FROM production WHERE ts >= ? AND ts <= ?", (start_sql, end_sql))
-        conn.executemany("DELETE FROM jours_charges WHERE jour = ?", [(str(j),) for j in jours])
-        conn.commit()
-    try:
-        neon = _neon_get()
+    with _db_lock:
+        conn = _conn()
         try:
-            with neon:
-                with neon.cursor() as cur:
-                    cur.execute("DELETE FROM production WHERE ts >= %s AND ts <= %s", (start_sql, end_sql))
-                    cur.executemany("DELETE FROM jours_charges WHERE jour = %s", [(str(j),) for j in jours])
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM production WHERE ts >= %s AND ts <= %s",
+                        (start_sql, end_sql)
+                    )
+                    cur.executemany(
+                        "DELETE FROM jours_charges WHERE jour = %s",
+                        [(str(j),) for j in jours]
+                    )
         finally:
-            _neon_put(neon)
-    except Exception:
-        pass
+            conn.close()
     stats_cache.clear()
-    charger_depuis_db.clear()
     return len(jours)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. API ENTSO-E — 1 JOUR PAR REQUÊTE, EN PARALLÈLE
+# 3. API ENTSO-E
 # ══════════════════════════════════════════════════════════════════
 
-def api_telecharger_jour(jour: date) -> tuple[date, pd.DataFrame, str]:
-    """
-    1 appel ENTSO-E = 1 jour. Fonction PURE : aucun appel st.* (exécutée en thread).
-    Retourne (jour, df, message_erreur).
-    """
-    try:
-        client   = EntsoePandasClient(api_key=API_KEY)
-        start_ts = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
-        end_ts   = pd.Timestamp(str(jour) + " 23:59", tz=TZ)
-        df_raw   = client.query_generation_per_plant(
-            country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
-        )
-        if df_raw is None or df_raw.empty:
-            return jour, pd.DataFrame(), "Aucune donnée publiée par ENTSO-E"
-        return jour, extraire_actual_aggregated(df_raw), ""
-    except Exception as exc:
-        msg = f"{type(exc).__name__}: {exc}"[:200]
-        print(f"[ENTSO-E ERREUR] {jour} -> {msg}", flush=True)
-        return jour, pd.DataFrame(), msg
+def api_telecharger_jour(jour: date) -> bool:
+    """Télécharge un jour depuis ENTSO-E et le sauvegarde dans Neon."""
+    client   = EntsoePandasClient(api_key=API_KEY)
+    start_ts = pd.Timestamp(str(jour) + " 00:00", tz=TZ)
+    end_ts   = pd.Timestamp(str(jour) + " 23:59", tz=TZ)
+    df_raw   = client.query_generation_per_plant(
+        country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
+    )
+    if df_raw is None or df_raw.empty:
+        return False
+    sauvegarder_en_db(jour, extraire_actual_aggregated(df_raw))
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. INTERFACE STREAMLIT
+# 4. INTERFACE STREAMLIT
 # ══════════════════════════════════════════════════════════════════
 
-_init_local_db()
+init_db()
 
 st.set_page_config(page_title="☢️ Modulation nucléaire France", layout="wide", page_icon="☢️")
 st.title("☢️ Modulation nucléaire par réacteur — France")
-st.caption("Production normalisée par la puissance nominale (IAEA PRIS) · Cache : local + Neon · Données : ENTSO-E")
+st.caption("Production normalisée par la puissance nominale (IAEA PRIS) · Cache : Neon · Données : ENTSO-E")
 
 with st.sidebar:
     st.header("📅 Période")
@@ -401,7 +340,7 @@ with st.sidebar:
     st.markdown("---")
     info = stats_cache()
     if info["n"] == 0:
-        st.caption("📂 Base vide — premier lancement.")
+        st.caption("📂 Base Neon vide — premier lancement.")
     else:
         st.caption(f"☁️ Neon : **{info['n']} jours** en cache\n\nDu {info['min']} au {info['max']}")
     st.markdown("**Source Pnom** : IAEA PRIS · [pris.iaea.org](https://pris.iaea.org/pris/CountryStatistics/CountryDetails.aspx?current=FR)")
@@ -419,53 +358,56 @@ if start_date > end_date:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. CHARGEMENT
+# 5. CHARGEMENT
 # ══════════════════════════════════════════════════════════════════
 
 def charger_periode(start: date, end: date) -> tuple[pd.DataFrame, int, int]:
-    tous      = [start + timedelta(days=i) for i in range((end - start).days + 1)]
-    a_fetcher = jours_a_fetcher_depuis_db(tous)
-    nb_cache  = len(tous) - len(a_fetcher)
+    tous_les_jours  = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    jours_a_fetcher = [j for j in tous_les_jours if not jour_est_cache(j)]
+    nb_cache        = len(tous_les_jours) - len(jours_a_fetcher)
+    echecs: list[tuple[str, str]] = []
+    lock    = threading.Lock()
+    counter = {"n": 0}
 
-    if not a_fetcher:
-        return charger_depuis_db(start, end), nb_cache, 0
+    if jours_a_fetcher:
+        barre = st.progress(0.0, text="⚡ Téléchargement des jours manquants…")
 
-    charger_depuis_db.clear()
-    all_data: dict[date, pd.DataFrame] = {}
-    echecs:   list[tuple[str, str]]   = []
-    barre   = st.progress(0.0, text=f"⚡ {len(a_fetcher)} jour(s) à télécharger…")
+        def _fetch(j: date) -> tuple[date, bool]:
+            ok = api_telecharger_jour(j)
+            with lock:
+                counter["n"] += 1
+                barre.progress(
+                    counter["n"] / len(jours_a_fetcher),
+                    text=f"⚡ Téléchargé {counter['n']}/{len(jours_a_fetcher)} jour(s)…",
+                )
+            return j, ok
 
-    # Téléchargement SÉQUENTIEL dans le thread principal.
-    # Pas de ThreadPoolExecutor → pas de NoSessionContext possible.
-    # Un seul client ENTSO-E réutilisé pour tous les jours.
-    client = EntsoePandasClient(api_key=API_KEY)
-    for i, j in enumerate(a_fetcher):
-        try:
-            start_ts = pd.Timestamp(str(j) + " 00:00", tz=TZ)
-            end_ts   = pd.Timestamp(str(j) + " 23:59", tz=TZ)
-            df_raw   = client.query_generation_per_plant(
-                country_code=COUNTRY, start=start_ts, end=end_ts, psr_type="B14"
-            )
-            if df_raw is None or df_raw.empty:
-                echecs.append((str(j), "Aucune donnée publiée par ENTSO-E"))
-            else:
-                all_data[j] = extraire_actual_aggregated(df_raw)
-        except Exception as exc:
-            echecs.append((str(j), f"{type(exc).__name__}: {exc}"[:200]))
-        barre.progress((i + 1) / len(a_fetcher), text=f"⚡ {i+1}/{len(a_fetcher)} jour(s)…")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_API) as ex:
+            futures = {ex.submit(_fetch, j): j for j in jours_a_fetcher}
+            try:
+                for fut in as_completed(futures, timeout=120):
+                    try:
+                        j, ok = fut.result(timeout=60)
+                        if not ok:
+                            echecs.append((str(j), "Aucune donnée retournée par l'API"))
+                    except Exception as exc:
+                        echecs.append((str(futures[fut]), str(exc)))
+            except Exception:
+                for fut in futures:
+                    fut.cancel()
+                echecs += [
+                    (str(futures[fut]), "Timeout — ENTSO-E n'a pas répondu")
+                    for fut in futures if not fut.done()
+                ]
 
-    barre.empty()
-
-    if all_data:
-        sauvegarder_plage_en_db(all_data)
-
-    if echecs:
-        with st.expander(f"⚠️ {len(echecs)} jour(s) en erreur"):
-            for j, err in echecs:
-                st.write(f"**{j}** : {err}")
+        barre.empty()
+        if echecs:
+            with st.expander(f"⚠️ {len(echecs)} jour(s) en erreur"):
+                for j, err in echecs:
+                    st.write(f"**{j}** : {err}")
 
     df     = charger_depuis_db(start, end)
-    nb_api = len(all_data)
+    nb_api = len(jours_a_fetcher) - len(echecs)
     return df, nb_cache, nb_api
 
 
@@ -483,13 +425,13 @@ if df_brut is None or df_brut.empty:
 stats_cache.clear()
 st.success(
     f"✅ Données chargées — {start_date} → {end_date}  ·  "
-    f"☁️ {nb_cache} jour(s) depuis le cache  ·  "
+    f"☁️ {nb_cache} jour(s) depuis Neon  ·  "
     f"🌐 {nb_api} jour(s) téléchargé(s) depuis l'API"
 )
 
 
 # ══════════════════════════════════════════════════════════════════
-# 8. TRAITEMENT
+# 6. TRAITEMENT
 # ══════════════════════════════════════════════════════════════════
 
 df_nuc = extraire_actual_aggregated(df_brut)
@@ -516,7 +458,7 @@ taux_moyen    = taux_derniere[taux_derniere >= SEUIL_ON_PCT].mean()
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. MÉTRIQUES
+# 7. MÉTRIQUES
 # ══════════════════════════════════════════════════════════════════
 
 st.markdown("---")
@@ -530,7 +472,7 @@ st.markdown("---")
 
 
 # ══════════════════════════════════════════════════════════════════
-# 10. HEATMAP
+# 8. HEATMAP
 # ══════════════════════════════════════════════════════════════════
 
 st.subheader("🔲 Heatmap — Taux de charge par réacteur (% Pnom)")
@@ -562,14 +504,14 @@ st.plotly_chart(fig_heatmap, use_container_width=True, theme=None)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 11. SPARKLINES
+# 9. SPARKLINES
 # ══════════════════════════════════════════════════════════════════
 
 st.subheader("📈 Courbes individuelles — Taux de charge par réacteur")
 st.caption("🟢 Vert = en marche · 🔴 Rouge = arrêté · Axe Y = % Pnom (IAEA PRIS)")
 
 n_rows_spark = max(1, math.ceil(len(reacteurs) / N_COLS_SPARKLINES))
-titres       = [f"{r}<br>{serie_pnom[r]:.0f} MW" for r in reacteurs]
+titres = [f"{r}<br>{serie_pnom[r]:.0f} MW" for r in reacteurs]
 
 fig_spark = make_subplots(
     rows=n_rows_spark, cols=N_COLS_SPARKLINES,
@@ -622,7 +564,7 @@ st.plotly_chart(fig_spark, use_container_width=True, theme=None)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 12. TABLEAU & TÉLÉCHARGEMENT
+# 10. TABLEAU & TÉLÉCHARGEMENT
 # ══════════════════════════════════════════════════════════════════
 
 with st.expander("📋 Tableau — taux de charge par réacteur (dernière valeur)"):
